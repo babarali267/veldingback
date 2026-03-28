@@ -103,7 +103,7 @@ const quotationSchema = new mongoose.Schema({
     default: 0
   },
   
-  // ✅ NEW: Estimate Fields
+  // Estimate Fields
   estimate: {
     low: {
       type: Number,
@@ -119,11 +119,18 @@ const quotationSchema = new mongoose.Schema({
     }
   },
   
-  // Status
+  // ✅ Status - ADD 'converted' to enum
   status: {
     type: String,
-    enum: ['draft', 'sent', 'accepted', 'rejected', 'expired'],
+    enum: ['draft', 'sent', 'accepted', 'rejected', 'expired', 'converted'],
     default: 'draft'
+  },
+  
+  // ✅ Reference to Order when converted
+  orderId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "Order",
+    default: null
   },
   
   // Validity

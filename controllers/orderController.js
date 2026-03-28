@@ -1,9 +1,217 @@
+// backend/controllers/orderController.js
 import Order from "../models/Order.js";
 import Customer from "../models/Customer.js";
+import QuotationCustomer from "../models/quotationCustomer.js";
 import Admin from "../models/Admin.js";
+import Quotation from "../models/quotation.js";
 import { sendDueDateReminder } from "../utils/emailService.js";
 
-// ✅ Create Order
+// Helper function to find or create customer from quotation data
+const findOrCreateCustomerFromQuotation = async (quotation) => {
+  try {
+    // First try to find by phone in regular Customer collection
+    let customer = await Customer.findOne({ phone: quotation.customerPhone });
+    
+    if (customer) {
+      console.log("✅ Found existing regular customer by phone:", customer.name);
+      return customer;
+    }
+    
+    // If not found, try to find by name
+    customer = await Customer.findOne({ name: quotation.customerName });
+    
+    if (customer) {
+      console.log("✅ Found existing regular customer by name:", customer.name);
+      return customer;
+    }
+    
+    // Create new customer from quotation data
+    customer = new Customer({
+      name: quotation.customerName,
+      phone: quotation.customerPhone || '',
+      address: quotation.customerAddress || '',
+      orders: []
+    });
+    
+    await customer.save();
+    console.log("✅ Created new customer from quotation:", customer.name);
+    
+    return customer;
+  } catch (error) {
+    console.error("❌ Error finding/creating customer:", error);
+    throw error;
+  }
+};
+
+// ✅ Create Order from Quotation
+export const createOrderFromQuotation = async (req, res) => {
+  try {
+    const { quotationId, finalTotal, advancePayment, dueDate, notes, status, items } = req.body;
+    
+    console.log("📦 Creating order from quotation:", { 
+      quotationId, 
+      finalTotal, 
+      advancePayment, 
+      itemsCount: items?.length 
+    });
+    
+    // Validate required fields
+    if (!quotationId) {
+      return res.status(400).json({
+        success: false,
+        message: "Quotation ID is required"
+      });
+    }
+    
+    // Find quotation
+    const quotation = await Quotation.findById(quotationId);
+    if (!quotation) {
+      return res.status(404).json({
+        success: false,
+        message: "Quotation not found"
+      });
+    }
+    
+    console.log("✅ Quotation found:", quotation.quotationNumber);
+    
+    // Check if already converted
+    if (quotation.status === 'converted') {
+      return res.status(400).json({
+        success: false,
+        message: "This quotation has already been converted to an order"
+      });
+    }
+    
+    // Generate bill number
+    const timestamp = Date.now();
+    const random = Math.floor(Math.random() * 1000);
+    const billNumber = `ORD-${timestamp.toString().slice(-8)}-${random}`;
+    
+    // Calculate amounts
+    const finalTotalAmount = finalTotal || quotation.grandTotal;
+    const advancePaymentAmount = advancePayment || 0;
+    const remainingBalance = finalTotalAmount - advancePaymentAmount;
+    
+    // Determine payment status
+    let paymentStatus = 'pending';
+    if (advancePaymentAmount >= finalTotalAmount) {
+      paymentStatus = 'paid';
+    } else if (advancePaymentAmount > 0) {
+      paymentStatus = 'partial';
+    }
+    
+    // Find or create regular customer from quotation data
+    const customer = await findOrCreateCustomerFromQuotation(quotation);
+    
+    // Prepare order items
+    let orderItems = [];
+    
+    if (items && items.length > 0) {
+      // Use items from the request (from CreateQuotationOrder page)
+      orderItems = items.map(item => ({
+        itemName: item.itemName || item.name,
+        quantity: Number(item.quantity) || 1,
+        unitPrice: Number(item.unitPrice) || Number(item.rate) || 0,
+        totalPrice: Number(item.totalPrice) || Number(item.total) || ((Number(item.quantity) || 1) * (Number(item.unitPrice) || Number(item.rate) || 0)),
+        notes: item.notes || ''
+      }));
+    } else if (quotation.items && quotation.items.length > 0) {
+      // Convert quotation items to order items
+      quotation.items.forEach(item => {
+        if (item.materials && item.materials.length > 0) {
+          item.materials.forEach(material => {
+            orderItems.push({
+              itemName: material.name || item.title || 'Material',
+              quantity: Number(material.quantity) || 1,
+              unitPrice: Number(material.pricePerUnit) || 0,
+              totalPrice: Number(material.totalPrice) || 0,
+              notes: item.notes || ''
+            });
+          });
+        } else {
+          orderItems.push({
+            itemName: item.title || 'Work Item',
+            quantity: 1,
+            unitPrice: Number(item.subtotal) || 0,
+            totalPrice: Number(item.subtotal) || 0,
+            notes: item.notes || ''
+          });
+        }
+      });
+    }
+    
+    if (orderItems.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "No items found in quotation"
+      });
+    }
+    
+    console.log(`📦 Creating order with ${orderItems.length} items`);
+    
+    // Create order
+    const order = new Order({
+      customer: customer._id,
+      items: orderItems,
+      finalTotal: Number(finalTotalAmount),
+      advancePayment: Number(advancePaymentAmount),
+      remainingBalance: Number(remainingBalance),
+      paymentStatus: paymentStatus,
+      billNumber: billNumber,
+      date: new Date(),
+      dueDate: dueDate || null,
+      status: status || 'pending',
+      notes: notes || `Order created from quotation: ${quotation.quotationNumber || quotation._id}`,
+      quotationId: quotation._id
+    });
+    
+    await order.save();
+    console.log("✅ Order saved:", order._id);
+    
+    // Update quotation
+    quotation.orderId = order._id;
+    quotation.status = 'converted';
+    await quotation.save();
+    console.log("✅ Quotation updated to converted status");
+    
+    // Add order to customer's orders array
+    await Customer.findByIdAndUpdate(
+      customer._id,
+      { $push: { orders: order._id } }
+    );
+    
+    // Update QuotationCustomer stats if exists
+    if (quotation.customer) {
+      await QuotationCustomer.findByIdAndUpdate(
+        quotation.customer,
+        { 
+          $inc: { totalQuotations: 1 }, 
+          lastQuotationDate: new Date() 
+        }
+      );
+      console.log("✅ QuotationCustomer stats updated");
+    }
+    
+    // Populate customer details
+    const populatedOrder = await Order.findById(order._id)
+      .populate('customer', 'name phone address');
+    
+    res.status(201).json({
+      success: true,
+      message: "Order created successfully from quotation",
+      order: populatedOrder
+    });
+    
+  } catch (error) {
+    console.error("❌ Error creating order from quotation:", error);
+    res.status(500).json({
+      success: false,
+      message: error.message || "Error creating order from quotation"
+    });
+  }
+};
+
+// ✅ Regular Create Order
 export const createOrder = async (req, res) => {
   try {
     console.log("📦 Creating order with data:", req.body);
@@ -14,6 +222,18 @@ export const createOrder = async (req, res) => {
         success: false, 
         message: "Customer ID is required" 
       });
+    }
+
+    // Validate items if provided
+    if (req.body.items && req.body.items.length > 0) {
+      for (const item of req.body.items) {
+        if (!item.itemName || !item.quantity || !item.unitPrice) {
+          return res.status(400).json({ 
+            success: false, 
+            message: "Each item must have itemName, quantity, and unitPrice" 
+          });
+        }
+      }
     }
 
     if (!req.body.finalTotal || req.body.finalTotal <= 0) {
@@ -32,20 +252,39 @@ export const createOrder = async (req, res) => {
       });
     }
 
-    // Create order - only customer ID is stored, name/phone/address are not needed
+    // Calculate item totals if items are provided
+    let items = [];
+    if (req.body.items && req.body.items.length > 0) {
+      items = req.body.items.map(item => ({
+        itemName: item.itemName,
+        quantity: Number(item.quantity),
+        unitPrice: Number(item.unitPrice),
+        totalPrice: Number(item.quantity) * Number(item.unitPrice),
+        notes: item.notes || ''
+      }));
+    }
+
+    // Generate bill number if not provided
+    const timestamp = Date.now();
+    const random = Math.floor(Math.random() * 1000);
+    const billNumber = req.body.billNumber || `ORD-${timestamp.toString().slice(-8)}-${random}`;
+
+    // Create order
     const order = new Order({
       customer: req.body.customer,
-      billNumber: req.body.billNumber || 'ORD-' + Date.now().toString().slice(-8) + '-' + Math.floor(Math.random() * 1000),
+      items: items,
+      billNumber: billNumber,
       finalTotal: Number(req.body.finalTotal),
       advancePayment: Number(req.body.advancePayment || 0),
       status: req.body.status || 'pending',
       notes: req.body.notes || '',
       date: req.body.date || new Date(),
-      dueDate: req.body.dueDate || null // Add dueDate if you have it in your schema
+      dueDate: req.body.dueDate || null,
+      quotationId: req.body.quotationId || null
     });
 
     const savedOrder = await order.save();
-    console.log("✅ Order saved:", savedOrder);
+    console.log("✅ Order saved:", savedOrder._id);
 
     // Update customer with new order
     await Customer.findByIdAndUpdate(
@@ -57,15 +296,13 @@ export const createOrder = async (req, res) => {
     const populatedOrder = await Order.findById(savedOrder._id)
       .populate("customer", "name phone address");
 
-    // 📧 SEND EMAIL NOTIFICATION TO ALL ADMINS
+    // Send email notifications to admins
     try {
-      // Get all admins
       const admins = await Admin.find({}).select('name email');
       
       if (admins.length > 0) {
         console.log(`📧 Sending new order notification to ${admins.length} admins`);
         
-        // Calculate days remaining if dueDate exists
         let daysRemaining = null;
         if (savedOrder.dueDate) {
           const today = new Date();
@@ -74,7 +311,6 @@ export const createOrder = async (req, res) => {
           daysRemaining = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
         }
         
-        // Prepare order details for email
         const orderDetails = {
           customerName: customerExists.name,
           billNumber: savedOrder.billNumber,
@@ -83,10 +319,10 @@ export const createOrder = async (req, res) => {
           advancePayment: savedOrder.advancePayment,
           remainingBalance: savedOrder.remainingBalance,
           daysRemaining: daysRemaining !== null ? daysRemaining : 0,
-          status: savedOrder.status
+          status: savedOrder.status,
+          items: savedOrder.items
         };
         
-        // Send email to each admin
         for (const admin of admins) {
           await sendDueDateReminder(admin.email, admin.name, orderDetails);
         }
@@ -95,7 +331,6 @@ export const createOrder = async (req, res) => {
       }
     } catch (emailError) {
       console.error("❌ Error sending new order email notifications:", emailError);
-      // Don't fail the order creation if email fails
     }
 
     res.status(201).json({
@@ -106,7 +341,6 @@ export const createOrder = async (req, res) => {
   } catch (error) {
     console.error("❌ Error creating order:", error);
     
-    // Handle duplicate key error (billNumber)
     if (error.code === 11000) {
       return res.status(400).json({ 
         success: false, 
@@ -114,7 +348,6 @@ export const createOrder = async (req, res) => {
       });
     }
 
-    // Handle validation errors
     if (error.name === "ValidationError") {
       const messages = Object.values(error.errors).map(err => err.message);
       return res.status(400).json({ 
@@ -206,7 +439,6 @@ export const getOrdersByCustomer = async (req, res) => {
 // ✅ Update Order
 export const updateOrder = async (req, res) => {
   try {
-    // Get original order before update
     const originalOrder = await Order.findById(req.params.id);
     
     if (!originalOrder) {
@@ -216,13 +448,11 @@ export const updateOrder = async (req, res) => {
       });
     }
 
-    // Calculate remaining balance if finalTotal or advancePayment is updated
     if (req.body.finalTotal !== undefined || req.body.advancePayment !== undefined) {
       const finalTotal = req.body.finalTotal !== undefined ? req.body.finalTotal : originalOrder.finalTotal;
       const advancePayment = req.body.advancePayment !== undefined ? req.body.advancePayment : originalOrder.advancePayment;
       req.body.remainingBalance = finalTotal - advancePayment;
       
-      // Update payment status
       if (advancePayment >= finalTotal) {
         req.body.paymentStatus = 'paid';
       } else if (advancePayment > 0) {
@@ -238,58 +468,11 @@ export const updateOrder = async (req, res) => {
       { new: true, runValidators: true }
     ).populate("customer", "name phone address");
 
-    // 📧 SEND EMAIL NOTIFICATION FOR ORDER UPDATE
-    try {
-      // Check if important fields changed
-      const importantChanges = [];
-      if (req.body.status && req.body.status !== originalOrder.status) {
-        importantChanges.push(`status changed from ${originalOrder.status} to ${req.body.status}`);
-      }
-      if (req.body.dueDate && req.body.dueDate !== originalOrder.dueDate?.toISOString()) {
-        importantChanges.push('due date updated');
-      }
-      if (req.body.finalTotal && req.body.finalTotal !== originalOrder.finalTotal) {
-        importantChanges.push('final total updated');
-      }
-      
-      if (importantChanges.length > 0) {
-        const admins = await Admin.find({}).select('name email');
-        
-        if (admins.length > 0) {
-          console.log(`📧 Sending order update notification to ${admins.length} admins`);
-          
-          const customer = await Customer.findById(updatedOrder.customer);
-          
-          // Calculate days remaining
-          let daysRemaining = null;
-          if (updatedOrder.dueDate) {
-            const today = new Date();
-            const dueDate = new Date(updatedOrder.dueDate);
-            const diffTime = dueDate - today;
-            daysRemaining = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-          }
-          
-          const orderDetails = {
-            customerName: customer?.name || 'Unknown',
-            billNumber: updatedOrder.billNumber,
-            dueDate: updatedOrder.dueDate || new Date(),
-            finalTotal: updatedOrder.finalTotal,
-            advancePayment: updatedOrder.advancePayment,
-            remainingBalance: updatedOrder.remainingBalance,
-            daysRemaining: daysRemaining !== null ? daysRemaining : 0,
-            status: updatedOrder.status,
-            changes: importantChanges.join(', ')
-          };
-          
-          for (const admin of admins) {
-            await sendDueDateReminder(admin.email, admin.name, orderDetails);
-          }
-          
-          console.log(`✅ Order update notifications sent successfully`);
-        }
-      }
-    } catch (emailError) {
-      console.error("❌ Error sending update email notifications:", emailError);
+    if (!updatedOrder) {
+      return res.status(404).json({ 
+        success: false, 
+        message: "Order not found" 
+      });
     }
 
     res.status(200).json({
@@ -327,7 +510,6 @@ export const deleteOrder = async (req, res) => {
       });
     }
 
-    // Remove order from customer's orders array
     await Customer.findByIdAndUpdate(
       deletedOrder.customer,
       { $pull: { orders: deletedOrder._id } }
@@ -380,45 +562,6 @@ export const updateOrderStatus = async (req, res) => {
       });
     }
 
-    // 📧 SEND EMAIL FOR STATUS CHANGE
-    try {
-      const admins = await Admin.find({}).select('name email');
-      
-      if (admins.length > 0) {
-        console.log(`📧 Sending status update notification to ${admins.length} admins`);
-        
-        const customer = await Customer.findById(updatedOrder.customer);
-        
-        // Calculate days remaining
-        let daysRemaining = null;
-        if (updatedOrder.dueDate) {
-          const today = new Date();
-          const dueDate = new Date(updatedOrder.dueDate);
-          const diffTime = dueDate - today;
-          daysRemaining = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-        }
-        
-        const orderDetails = {
-          customerName: customer?.name || 'Unknown',
-          billNumber: updatedOrder.billNumber,
-          dueDate: updatedOrder.dueDate || new Date(),
-          finalTotal: updatedOrder.finalTotal,
-          advancePayment: updatedOrder.advancePayment,
-          remainingBalance: updatedOrder.remainingBalance,
-          daysRemaining: daysRemaining !== null ? daysRemaining : 0,
-          status: updatedOrder.status
-        };
-        
-        for (const admin of admins) {
-          await sendDueDateReminder(admin.email, admin.name, orderDetails);
-        }
-        
-        console.log(`✅ Status update notifications sent successfully`);
-      }
-    } catch (emailError) {
-      console.error("❌ Error sending status update email:", emailError);
-    }
-
     res.status(200).json({
       success: true,
       data: updatedOrder,
@@ -454,11 +597,9 @@ export const addPayment = async (req, res) => {
       });
     }
 
-    // Update advance payment and remaining balance
     order.advancePayment = (order.advancePayment || 0) + paymentAmount;
     order.remainingBalance = order.finalTotal - order.advancePayment;
 
-    // Update payment status
     if (order.advancePayment >= order.finalTotal) {
       order.paymentStatus = 'paid';
     } else if (order.advancePayment > 0) {
@@ -469,37 +610,6 @@ export const addPayment = async (req, res) => {
 
     const updatedOrder = await Order.findById(order._id)
       .populate("customer", "name phone address");
-
-    // 📧 SEND EMAIL FOR PAYMENT ADDED
-    try {
-      const admins = await Admin.find({}).select('name email');
-      
-      if (admins.length > 0) {
-        console.log(`📧 Sending payment notification to ${admins.length} admins`);
-        
-        const customer = await Customer.findById(updatedOrder.customer);
-        
-        const orderDetails = {
-          customerName: customer?.name || 'Unknown',
-          billNumber: updatedOrder.billNumber,
-          dueDate: updatedOrder.dueDate || new Date(),
-          finalTotal: updatedOrder.finalTotal,
-          advancePayment: updatedOrder.advancePayment,
-          remainingBalance: updatedOrder.remainingBalance,
-          daysRemaining: 0,
-          status: updatedOrder.status,
-          paymentAdded: paymentAmount
-        };
-        
-        for (const admin of admins) {
-          await sendDueDateReminder(admin.email, admin.name, orderDetails);
-        }
-        
-        console.log(`✅ Payment notifications sent successfully`);
-      }
-    } catch (emailError) {
-      console.error("❌ Error sending payment email:", emailError);
-    }
 
     res.status(200).json({
       success: true,

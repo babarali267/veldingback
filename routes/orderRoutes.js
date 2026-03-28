@@ -5,7 +5,7 @@ import {
   getOrderById,
   getOrdersByCustomer,
   updateOrder,
-  deleteOrder
+  deleteOrder,createOrderFromQuotation
 } from "../controllers/orderController.js";
 import { protect } from "../middleware/auth.js";
  
@@ -19,7 +19,7 @@ router.get("/", protect, getAllOrders);
 router.get("/customer/:customerId", protect, getOrdersByCustomer);
 
 router.get("/:id", protect, getOrderById);
-
+router.post("/from-quotation", protect, createOrderFromQuotation);
 router.put("/:id", protect, updateOrder);
 
 router.delete("/:id", protect, deleteOrder);

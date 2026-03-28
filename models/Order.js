@@ -1,3 +1,4 @@
+// models/Order.js
 import mongoose from "mongoose";
 
 const orderSchema = new mongoose.Schema({
@@ -7,6 +8,34 @@ const orderSchema = new mongoose.Schema({
     ref: "Customer",
     required: true
   },
+
+  // ========== Order Items (Products/Services) ==========
+  items: [{
+    itemName: {
+      type: String,
+      required: true
+    },
+    quantity: {
+      type: Number,
+      required: true,
+      min: 1,
+      default: 1
+    },
+    unitPrice: {
+      type: Number,
+      required: true,
+      min: 0
+    },
+    totalPrice: {
+      type: Number,
+      required: true,
+      min: 0
+    },
+    notes: {
+      type: String,
+      default: ''
+    }
+  }],
 
   // ========== Payment Details ==========
   finalTotal: {
@@ -45,10 +74,9 @@ const orderSchema = new mongoose.Schema({
     required: true,
     default: Date.now
   },
-  // ✅ NEW: Due Date field
   dueDate: {
     type: Date,
-    required: false, // Optional field
+    required: false,
     default: null
   },
   status: {
@@ -61,6 +89,13 @@ const orderSchema = new mongoose.Schema({
   notes: {
     type: String,
     default: ''
+  },
+
+  // ========== Reference to Quotation (if created from quotation) ==========
+  quotationId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "Quotation",
+    required: false
   },
 
   // ========== Timestamps ==========
@@ -81,6 +116,14 @@ orderSchema.pre('save', async function() {
   try {
     console.log("🔄 Order pre-save middleware running for:", this._id || 'new order');
     
+    // If items are provided, calculate total from items
+    if (this.items && this.items.length > 0) {
+      const calculatedTotal = this.items.reduce((sum, item) => sum + (item.totalPrice || 0), 0);
+      if (calculatedTotal > 0 && !this.finalTotal) {
+        this.finalTotal = calculatedTotal;
+      }
+    }
+    
     // Calculate remaining balance
     this.remainingBalance = (this.finalTotal || 0) - (this.advancePayment || 0);
     
@@ -97,6 +140,7 @@ orderSchema.pre('save', async function() {
     this.updatedAt = new Date();
     
     console.log("✅ Order pre-save completed");
+    console.log("   Items:", this.items?.length || 0);
     console.log("   Final Total:", this.finalTotal);
     console.log("   Advance:", this.advancePayment);
     console.log("   Remaining:", this.remainingBalance);
@@ -113,6 +157,7 @@ orderSchema.pre('save', async function() {
 orderSchema.post('save', function(doc) {
   console.log("📦 Order saved successfully:", doc._id);
   console.log("   Bill Number:", doc.billNumber);
+  console.log("   Items Count:", doc.items?.length || 0);
   console.log("   Due Date:", doc.dueDate);
 });
 
